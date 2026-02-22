@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MEGA PDF Editor (Web)</title>
+  <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: #f4f6f8; color: #111; }
+    .app { max-width: 1100px; margin: 0 auto; padding: 12px; }
+    .card { background: #fff; border-radius: 12px; padding: 12px; margin-bottom: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+    input, button, select { font-size: 16px; padding: 10px; border-radius: 10px; border: 1px solid #ccc; }
+    button { background: #0a84ff; color: #fff; border: none; }
+    button.secondary { background: #5c5c5c; }
+    button.warning { background: #d35400; }
+    .row { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+    .row-3 { display: grid; gap: 8px; grid-template-columns: 1fr 1fr 1fr; }
+    @media (max-width: 700px) { .row, .row-3 { grid-template-columns: 1fr; } }
+    .canvas-wrap { position: relative; width: 100%; border: 1px solid #ddd; border-radius: 8px; overflow: auto; }
+    #pdfCanvas, #drawCanvas { width: 100%; display: block; touch-action: none; }
+    #drawCanvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .status { font-size: 14px; color: #444; margin-top: 8px; }
+    .hint { font-size: 13px; color: #666; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card">
+      <h2>MEGA PDF Editor – iPhone ready</h2>
+      <div class="row">
+        <input id="email" placeholder="MEGA email" />
+        <input id="password" type="password" placeholder="MEGA heslo" />
+      </div>
+      <div class="toolbar">
+        <button id="loadFilesBtn">Načíst PDF z MEGA</button>
+        <select id="fileSelect"><option value="">Vyber PDF</option></select>
+        <button id="openBtn">Otevřít</button>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-3">
+        <input id="newTextInput" placeholder="Text k vložení" />
+        <input id="newTextSize" type="number" value="18" min="8" max="72" />
+        <button id="addTextModeBtn">Režim: Přidat text</button>
+      </div>
+      <div class="row-3" style="margin-top:8px;">
+        <button id="drawModeBtn" class="secondary">Režim: Kreslení</button>
+        <button id="clearDrawBtn" class="warning">Smazat tahy</button>
+        <button id="applyDrawBtn">Zapsat kreslení do PDF</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input id="replaceFrom" placeholder="Najít text (na straně)" />
+        <input id="replaceTo" placeholder="Nahradit textem" />
+      </div>
+      <div class="toolbar">
+        <button id="replaceBtn" class="secondary">Nahradit text v PDF</button>
+        <button id="uploadBtn">Nahrát zpět do MEGA</button>
+      </div>
+      <div class="hint">Tip: V režimu "Přidat text" klikni/tapni do PDF, kam se má text vložit.</div>
+    </div>
+
+    <div class="card">
+      <div class="canvas-wrap">
+        <canvas id="pdfCanvas"></canvas>
+        <canvas id="drawCanvas"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    const statusEl = document.getElementById('status');
+    const emailEl = document.getElementById('email');
+    const passwordEl = document.getElementById('password');
+    const fileSelect = document.getElementById('fileSelect');
+    const pdfCanvas = document.getElementById('pdfCanvas');
+    const drawCanvas = document.getElementById('drawCanvas');
+    const drawCtx = drawCanvas.getContext('2d');
+
+    let editedPdfBytes = null;
+    let selectedFile = null;
+    let activePdfPage = null;
+    let activeViewport = null;
+
+    let mode = 'none';
+    let isDrawing = false;
+
+    const setStatus = (txt) => statusEl.textContent = txt;
+
+    async function callApi(path, payload, isForm = false) {
+      const res = await fetch(path, {
+        method: 'POST',
+        body: isForm ? payload : JSON.stringify(payload),
+        headers: isForm ? {} : { 'Content-Type': 'application/json' }
+      });
+      if (!res.ok) {
+        let msg = 'API error';
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      return res;
+    }
+
+    async function renderPdf(bytes) {
+      const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+      activePdfPage = await pdf.getPage(1);
+      activeViewport = activePdfPage.getViewport({ scale: 1.2 });
+      const ctx = pdfCanvas.getContext('2d');
+      pdfCanvas.width = activeViewport.width;
+      pdfCanvas.height = activeViewport.height;
+      drawCanvas.width = activeViewport.width;
+      drawCanvas.height = activeViewport.height;
+      drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+      await activePdfPage.render({ canvasContext: ctx, viewport: activeViewport }).promise;
+    }
+
+    function canvasPointFromEvent(e) {
+      const rect = drawCanvas.getBoundingClientRect();
+      const clientX = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+      const clientY = (e.touches && e.touches[0]) ? e.touches[0].clientY : e.clientY;
+      const x = (clientX - rect.left) * (drawCanvas.width / rect.width);
+      const y = (clientY - rect.top) * (drawCanvas.height / rect.height);
+      return { x, y };
+    }
+
+    function toPdfCoords(x, y, pageHeight) {
+      return { x, y: pageHeight - y };
+    }
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      drawCanvas.style.pointerEvents = mode === 'draw' || mode === 'addText' ? 'auto' : 'none';
+      setStatus(`Aktivní režim: ${mode}`);
+    }
+
+    async function saveDoc(mutator) {
+      if (!editedPdfBytes) throw new Error('Nejdřív otevři PDF.');
+      const { PDFDocument } = PDFLib;
+      const doc = await PDFDocument.load(editedPdfBytes);
+      const page = doc.getPages()[0];
+      await mutator(doc, page);
+      editedPdfBytes = await doc.save();
+      await renderPdf(editedPdfBytes);
+    }
+
+    document.getElementById('loadFilesBtn').onclick = async () => {
+      try {
+        setStatus('Načítám seznam PDF...');
+        const response = await callApi('/api/list-pdf', {
+          email: emailEl.value,
+          password: passwordEl.value
+        });
+        const data = await response.json();
+        fileSelect.innerHTML = '<option value="">Vyber PDF</option>';
+        data.files.forEach(file => {
+          const opt = document.createElement('option');
+          opt.value = file.id;
+          opt.textContent = file.name;
+          opt.dataset.name = file.name;
+          fileSelect.appendChild(opt);
+        });
+        setStatus(`Načteno ${data.files.length} PDF souborů.`);
+      } catch (e) { setStatus(e.message); }
+    };
+
+    document.getElementById('openBtn').onclick = async () => {
+      try {
+        if (!fileSelect.value) throw new Error('Nejdřív vyber PDF.');
+        selectedFile = {
+          id: fileSelect.value,
+          name: fileSelect.options[fileSelect.selectedIndex].dataset.name
+        };
+        setStatus('Stahuji PDF...');
+        const response = await callApi('/api/download-pdf', {
+          email: emailEl.value,
+          password: passwordEl.value,
+          nodeId: selectedFile.id
+        });
+        editedPdfBytes = new Uint8Array(await response.arrayBuffer());
+        await renderPdf(editedPdfBytes);
+        setMode('none');
+        setStatus(`Otevřeno: ${selectedFile.name}`);
+      } catch (e) { setStatus(e.message); }
+    };
+
+    document.getElementById('addTextModeBtn').onclick = () => setMode('addText');
+    document.getElementById('drawModeBtn').onclick = () => setMode('draw');
+
+    drawCanvas.addEventListener('pointerdown', (e) => {
+      if (mode !== 'draw') return;
+      isDrawing = true;
+      const p = canvasPointFromEvent(e);
+      drawCtx.beginPath();
+      drawCtx.moveTo(p.x, p.y);
+      drawCtx.lineWidth = 3;
+      drawCtx.lineCap = 'round';
+      drawCtx.strokeStyle = '#e74c3c';
+    });
+
+    drawCanvas.addEventListener('pointermove', (e) => {
+      if (mode !== 'draw' || !isDrawing) return;
+      const p = canvasPointFromEvent(e);
+      drawCtx.lineTo(p.x, p.y);
+      drawCtx.stroke();
+    });
+
+    const stopDraw = () => { isDrawing = false; };
+    drawCanvas.addEventListener('pointerup', stopDraw);
+    drawCanvas.addEventListener('pointerleave', stopDraw);
+
+    drawCanvas.addEventListener('click', async (e) => {
+      if (mode !== 'addText') return;
+      try {
+        const newText = document.getElementById('newTextInput').value.trim();
+        const size = Number(document.getElementById('newTextSize').value || 18);
+        if (!newText) throw new Error('Vyplň text k vložení.');
+        const p = canvasPointFromEvent(e);
+
+        await saveDoc(async (_doc, page) => {
+          const { rgb } = PDFLib;
+          const pdfP = toPdfCoords(p.x, p.y, page.getHeight());
+          page.drawText(newText, {
+            x: pdfP.x,
+            y: pdfP.y,
+            size,
+            color: rgb(0.1, 0.1, 0.1)
+          });
+        });
+
+        setStatus('Text byl vložen do PDF.');
+      } catch (err) {
+        setStatus(err.message);
+      }
+    });
+
+    document.getElementById('clearDrawBtn').onclick = () => {
+      drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+      setStatus('Kreslení vyčištěno.');
+    };
+
+    document.getElementById('applyDrawBtn').onclick = async () => {
+      try {
+        if (!editedPdfBytes) throw new Error('Nejdřív otevři PDF.');
+        const dataUrl = drawCanvas.toDataURL('image/png');
+        await saveDoc(async (doc, page) => {
+          const png = await doc.embedPng(dataUrl);
+          page.drawImage(png, { x: 0, y: 0, width: page.getWidth(), height: page.getHeight(), opacity: 1 });
+        });
+        drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+        setStatus('Kreslení bylo zapsáno do PDF.');
+      } catch (e) {
+        setStatus(e.message);
+      }
+    };
+
+    document.getElementById('replaceBtn').onclick = async () => {
+      try {
+        if (!editedPdfBytes || !activePdfPage || !activeViewport) throw new Error('Nejdřív otevři PDF.');
+        const from = document.getElementById('replaceFrom').value;
+        const to = document.getElementById('replaceTo').value;
+        if (!from || !to) throw new Error('Vyplň Najít i Nahradit.');
+
+        const textContent = await activePdfPage.getTextContent();
+        const matches = textContent.items.filter((i) => typeof i.str === 'string' && i.str.includes(from));
+        if (!matches.length) throw new Error('Text pro náhradu nebyl na první stránce nalezen.');
+
+        await saveDoc(async (_doc, page) => {
+          const { rgb } = PDFLib;
+          for (const item of matches) {
+            const tx = pdfjsLib.Util.transform(activeViewport.transform, item.transform);
+            const x = tx[4];
+            const yTop = tx[5];
+            const height = item.height || 14;
+            const width = item.width || (from.length * 8);
+            const pageH = page.getHeight();
+            const y = pageH - yTop;
+
+            page.drawRectangle({
+              x,
+              y: y - height,
+              width,
+              height: height + 2,
+              color: rgb(1, 1, 1)
+            });
+
+            page.drawText(item.str.replaceAll(from, to), {
+              x,
+              y: y - height + 2,
+              size: Math.max(10, height * 0.8),
+              color: rgb(0, 0, 0)
+            });
+          }
+        });
+
+        setStatus(`Nahrazeno ${matches.length} výskytů na stránce 1.`);
+      } catch (e) {
+        setStatus(e.message);
+      }
+    };
+
+    document.getElementById('uploadBtn').onclick = async () => {
+      try {
+        if (!editedPdfBytes || !selectedFile) throw new Error('Nejdřív otevři PDF.');
+        setStatus('Nahrávám upravené PDF do MEGA...');
+        const blob = new Blob([editedPdfBytes], { type: 'application/pdf' });
+        const form = new FormData();
+        form.append('email', emailEl.value);
+        form.append('password', passwordEl.value);
+        form.append('fileName', selectedFile.name.replace(/\.pdf$/i, '') + '-edited.pdf');
+        form.append('pdfFile', blob, 'edited.pdf');
+        await callApi('/api/upload-pdf', form, true);
+        setStatus('Hotovo: upravené PDF je nahrané v MEGA.');
+      } catch (e) { setStatus(e.message); }
+    };
+  </script>
+</body>
+</html>
